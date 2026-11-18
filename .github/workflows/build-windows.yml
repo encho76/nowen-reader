@@ -1,0 +1,158 @@
+name: Release Windows Client
+
+# Standalone Windows build for a fork. Uses workflow_dispatch only to avoid
+# racing with the upstream "Release Docker & Android" workflow on tag pushes.
+# Build output is a portable zip (no installer, no code signing required).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, e.g. 1.2.4 or 1.2.4-rc.1'
+        required: true
+        type: string
+      publish:
+        description: 'Attach the Windows package to the named GitHub Release'
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: true
+        type: string
+      publish:
+        description: 'Attach the Windows package to the named GitHub Release'
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.47.8'
+
+jobs:
+  build_windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reuses the repository's own validator for version format and build number.
+      # INPUT_PUBLISH is intentionally left unset so its tag-existence check is skipped.
+      - name: Validate version and build number
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUILD_NUMBER: ''
+          BUILD_NUMBER_BASE: ${{ vars.ANDROID_BUILD_NUMBER_BASE || '1000' }}
+        run: python scripts/release-metadata.py
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        working-directory: flutter_app
+        run: flutter --version
+
+      - name: Install dependencies
+        working-directory: flutter_app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: flutter_app
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Test
+        working-directory: flutter_app
+        run: flutter test --reporter expanded
+
+      - name: Build Windows release
+        working-directory: flutter_app
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+        run: flutter build windows --release --build-name="$env:VERSION" --build-number="$env:BUILD_NUMBER"
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "flutter_app/build/windows" -Recurse -Filter "nowen_reader.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "nowen_reader.exe not found under flutter_app/build/windows" }
+          $root = $exe.DirectoryName
+          if (-not (Test-Path (Join-Path $root "flutter_windows.dll"))) { throw "Missing Flutter runtime DLL in $root" }
+          if (-not (Test-Path (Join-Path $root "data"))) { throw "Missing data directory in $root" }
+          "WIN_RELEASE_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Release directory: $root"
+          Get-Item $exe.FullName | Select-Object FullName, Length
+
+      - name: Package portable zip and checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
+          $src = $env:WIN_RELEASE_DIR
+          if (-not $src) { throw "WIN_RELEASE_DIR not set by verify step" }
+          $zipName = "nowen-reader-v$env:VERSION-windows-x64.zip"
+          $zip = Join-Path "dist/windows" $zipName
+          Compress-Archive -Path "$src/*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$hash  $zipName" | Set-Content -Path dist/windows/SHA256SUMS -Encoding ascii
+          Get-Content dist/windows/SHA256SUMS
+
+      - name: Upload candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/windows/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Attach to Release
+    needs: build_windows
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: dist/windows
+
+      - name: Verify downloaded artifact
+        working-directory: dist/windows
+        run: sha256sum -c SHA256SUMS
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build_windows.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG exists; attaching Windows package."
+            gh release upload "$RELEASE_TAG" dist/windows/* --clobber
+          else
+            echo "Release $RELEASE_TAG not found; creating it with the Windows package."
+            gh release create "$RELEASE_TAG" dist/windows/* \
+              --title "NowenReader Windows $RELEASE_TAG" \
+              --generate-notes
+          fi
