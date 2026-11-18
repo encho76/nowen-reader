@@ -10,7 +10,7 @@ import '../../data/providers/server_branding_provider.dart';
 import '../../widgets/server_logo.dart';
 
 /// 预置的 NAS 服务器地址（Windows 客户端开箱即连）。
-const String kDefaultServerUrl = 'https://reader.fg912.com';
+const String kDefaultServerUrl = 'https://reader.d.fg912.com:16443';
 
 /// 服务器配置页面 —— 首次启动或切换服务器时显示。
 class ServerConfigScreen extends ConsumerStatefulWidget {
