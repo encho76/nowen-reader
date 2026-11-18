@@ -29,7 +29,29 @@ Future<ServerRouteConfig> loadServerRouteConfig(String primaryUrl) async {
       return ServerRouteConfig.fromJson(configs[primaryUrl]);
     }
   } catch (_) {
-    // Older installations only have server_url; retain it as a single route.
+    // Fall through to legacy-key lookup below.
+  }
+  // Migration: config may be stored under the legacy URL key. Find any key
+  // that maps to the requested URL, adopt it, and persist under the new key
+  // so backup route / mode settings are not lost.
+  for (final entry in configs.entries) {
+    if (migrateServerUrl(entry.key) == primaryUrl &&
+        entry.value is Map<String, dynamic>) {
+      final config = ServerRouteConfig.fromJson(entry.value);
+      final migrated = ServerRouteConfig(
+        primaryUrl: primaryUrl,
+        backupUrl: migrateServerUrl(config.backupUrl),
+        mode: config.mode,
+      );
+      configs
+        ..remove(entry.key)
+        ..[primaryUrl] = migrated.toJson();
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_configKey, jsonEncode(configs));
+      } catch (_) {}
+      return migrated;
+    }
   }
   return ServerRouteConfig(primaryUrl: primaryUrl);
 }
