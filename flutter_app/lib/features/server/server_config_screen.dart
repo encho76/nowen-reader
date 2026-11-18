@@ -4,13 +4,15 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../data/api/api_client.dart';
+import '../../data/services/server_route_service.dart';
 import '../../data/providers/auth_provider.dart';
 import '../../data/providers/server_route_provider.dart';
 import '../../data/providers/server_branding_provider.dart';
 import '../../widgets/server_logo.dart';
 
 /// 预置的 NAS 服务器地址（Windows 客户端开箱即连）。
-const String kDefaultServerUrl = 'https://reader.d.fg912.com:16443';
+/// 复用迁移目标常量，确保默认值与旧地址迁移结果一致。
+const String kDefaultServerUrl = kMigratedServerUrl;
 
 /// 服务器配置页面 —— 首次启动或切换服务器时显示。
 class ServerConfigScreen extends ConsumerStatefulWidget {
