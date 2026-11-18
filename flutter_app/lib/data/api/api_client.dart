@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -344,10 +344,19 @@ Future<Map<String, String>> getCookieHeaders(String url) async {
   return {};
 }
 
-/// 从 SharedPreferences 读取保存的服务器地址
+/// 从 SharedPreferences 读取保存的服务器地址。
+/// 若读到会触发 Cloudflare 301 的旧地址，自动迁移并持久化回写，
+/// 保证 POST 登录不再被降级为 GET。
 Future<String> loadServerUrl() async {
   final prefs = await SharedPreferences.getInstance();
-  return prefs.getString(_kServerUrlKey) ?? '';
+  final raw = prefs.getString(_kServerUrlKey) ?? '';
+  if (raw.isEmpty) return '';
+  final migrated = migrateServerUrl(raw);
+  if (migrated != raw) {
+    await prefs.setString(_kServerUrlKey, migrated);
+    debugPrint('[MIGRATE] server_url: $raw -> $migrated');
+  }
+  return migrated;
 }
 
 /// 保存服务器地址到 SharedPreferences
@@ -387,7 +396,7 @@ String getImageUrl(String serverUrl, String comicId,
 
 /// 服务器历史记录条目
 class ServerRecord {
-  final String url;
+  String url;
   final String? username;
   final String? nickname;
   final DateTime lastUsed;
@@ -414,14 +423,33 @@ class ServerRecord {
       );
 }
 
-/// 加载服务器历史列表
+/// 加载服务器历史列表。旧地址条目会被迁移，并与已存在的新地址去重。
 Future<List<ServerRecord>> loadServerHistory() async {
   final prefs = await SharedPreferences.getInstance();
   final raw = prefs.getString(_kServerHistoryKey);
   if (raw == null || raw.isEmpty) return [];
   try {
     final list = jsonDecode(raw) as List;
-    return list.map((e) => ServerRecord.fromJson(e as Map<String, dynamic>)).toList();
+    var records =
+        list.map((e) => ServerRecord.fromJson(e as Map<String, dynamic>)).toList();
+    var changed = false;
+    for (final r in records) {
+      final migrated = migrateServerUrl(r.url);
+      if (migrated != r.url) {
+        r.url = migrated;
+        changed = true;
+      }
+    }
+    // De-duplicate by URL, keeping the first (most recently used) entry.
+    final seen = <String>{};
+    final deduped = records.where((r) => seen.add(r.url)).toList();
+    if (deduped.length != records.length) changed = true;
+    if (changed) {
+      await prefs.setString(
+          _kServerHistoryKey, jsonEncode(deduped.map((e) => e.toJson()).toList()));
+      debugPrint('[MIGRATE] server_history migrated and de-duplicated');
+    }
+    return deduped;
   } catch (_) {
     return [];
   }
