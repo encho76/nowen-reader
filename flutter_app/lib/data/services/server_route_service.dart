@@ -16,8 +16,22 @@ enum ServerRouteVerification {
   unavailable,
 }
 
+// Legacy NAS address that Cloudflare 301-redirects to the direct :16443
+// endpoint. A 301 turns the POST /auth/login into GET and drops the body,
+// so existing installs must be transparently migrated to the direct URL.
+const String kLegacyServerUrl = 'https://reader.fg912.com';
+const String kMigratedServerUrl = 'https://reader.d.fg912.com:16443';
+
+/// Maps a previously saved legacy address to the working direct address.
+/// Only an exact match (ignoring trailing slashes) is migrated, so any other
+/// user-configured server is left untouched.
+String migrateServerUrl(String value) {
+  final cleaned = value.trim().replaceFirst(RegExp(r'/+$'), '');
+  return cleaned == kLegacyServerUrl ? kMigratedServerUrl : cleaned;
+}
+
 String normalizeServerUrl(String value) =>
-    value.trim().replaceFirst(RegExp(r'/+$'), '');
+    migrateServerUrl(value.trim()).replaceFirst(RegExp(r'/+$'), '');
 
 String? validateServerUrl(String value, {bool optional = false}) {
   if (value.trim().isEmpty) return optional ? null : '请输入服务器地址';
