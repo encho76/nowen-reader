@@ -1,0 +1,100 @@
+name: Sync upstream and rebuild Windows
+
+# Keeps the fork's main in sync with upstream, then rebuilds the Windows client.
+# Runs on a schedule and can be triggered manually. Upstream is MERGED, not
+# force-reset, so the fork's local changes (build-windows.yml and the preset
+# server URL) survive. If upstream edits the exact same lines, the merge fails
+# loudly instead of silently dropping your changes.
+#
+# The build is invoked via workflow_call, NOT by dispatching a second workflow
+# with GITHUB_TOKEN (GitHub does not chain workflows triggered by GITHUB_TOKEN).
+
+on:
+  schedule:
+    - cron: '0 18 * * 2,5'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Rebuild and publish even when upstream has no new commits'
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream main
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/cropflre/nowen-reader.git 2>/dev/null || git remote set-url upstream https://github.com/cropflre/nowen-reader.git
+          git fetch upstream main
+
+      - name: Check for upstream updates
+        id: check
+        run: |
+          BEFORE=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          if [ "$BEFORE" = "$UPSTREAM" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No new upstream commits."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commits: $BEFORE..$UPSTREAM"
+          fi
+
+      - name: Merge upstream into fork
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git merge upstream/main --no-edit -m "chore: sync upstream ${{ steps.check.outputs.upstream }}"
+          git push origin HEAD:main
+
+      - name: Read client version from pubspec
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version:' flutter_app/pubspec.yaml | sed -E 's/^version:[[:space:]]*//' | cut -d+ -f1)
+          if [ -z "$VERSION" ]; then echo "Could not read version" >&2; exit 1; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Client version: $VERSION"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          CHANGED: ${{ steps.check.outputs.changed }}
+          FORCE: ${{ inputs.force_build }}
+        run: |
+          if [ "$CHANGED" = "true" ] || [ "$FORCE" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build Windows client
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      version: ${{ needs.sync.outputs.version }}
+      publish: true
+    secrets: inherit
