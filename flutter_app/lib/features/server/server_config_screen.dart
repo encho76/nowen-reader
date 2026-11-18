@@ -9,6 +9,9 @@ import '../../data/providers/server_route_provider.dart';
 import '../../data/providers/server_branding_provider.dart';
 import '../../widgets/server_logo.dart';
 
+/// 预置的 NAS 服务器地址（Windows 客户端开箱即连）。
+const String kDefaultServerUrl = 'https://reader.fg912.com';
+
 /// 服务器配置页面 —— 首次启动或切换服务器时显示。
 class ServerConfigScreen extends ConsumerStatefulWidget {
   const ServerConfigScreen({super.key});
@@ -18,7 +21,7 @@ class ServerConfigScreen extends ConsumerStatefulWidget {
 }
 
 class _ServerConfigScreenState extends ConsumerState<ServerConfigScreen> {
-  final _urlCtrl = TextEditingController(text: 'http://');
+  final _urlCtrl = TextEditingController(text: kDefaultServerUrl);
   final _backupCtrl = TextEditingController();
   ServerRouteMode _mode = ServerRouteMode.automatic;
   final _formKey = GlobalKey<FormState>();
@@ -65,7 +68,7 @@ class _ServerConfigScreenState extends ConsumerState<ServerConfigScreen> {
       _mode = config.mode;
       if (savedUrl.isNotEmpty) {
         _urlCtrl.text = savedUrl;
-      } else if (history.isNotEmpty && _urlCtrl.text == 'http://') {
+      } else if (history.isNotEmpty && _urlCtrl.text == kDefaultServerUrl) {
         _urlCtrl.text = history.first.url;
       }
     });
