@@ -285,8 +285,8 @@ func BulkCreateComics(comics []struct {
 
 		now := time.Now().UTC()
 		stmt, err := tx.Prepare(`
-			INSERT INTO "Comic" ("id", "filename", "title", "titleSortKey", "pageCount", "fileSize", "type", "addedAt", "updatedAt")
-			VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+			INSERT INTO "Comic" ("id", "filename", "title", "titleSortKey", "pageCount", "fileSize", "type", "format", "editionStemKey", "editionMatchKey", "editionLabel", "addedAt", "updatedAt")
+			VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT("id") DO NOTHING
 		`)
 		if err != nil {
@@ -296,7 +296,11 @@ func BulkCreateComics(comics []struct {
 
 		for _, c := range comics {
 			comicType := detectComicType(c.Filename)
-			if _, err := stmt.Exec(c.ID, c.Filename, c.Title, BuildTitleSortKey(c.Title), c.FileSize, comicType, now, now); err != nil {
+			format := ExtractFileFormat(c.Filename)
+			stemKey := BuildEditionStemKey(c.Filename)
+			matchKey := BuildEditionMatchKey(c.Filename, c.Title)
+			edLabel := ExtractEditionLabel(c.Filename)
+			if _, err := stmt.Exec(c.ID, c.Filename, c.Title, BuildTitleSortKey(c.Title), c.FileSize, comicType, format, stemKey, matchKey, edLabel, now, now); err != nil {
 				return err
 			}
 		}
@@ -310,7 +314,7 @@ func detectComicType(filename string) string {
 	}
 	lower := strings.ToLower(filename)
 	if strings.HasSuffix(lower, ".txt") || strings.HasSuffix(lower, ".epub") ||
-		strings.HasSuffix(lower, ".mobi") ||
+		strings.HasSuffix(lower, ".mobi") || strings.HasSuffix(lower, ".azw3") ||
 		strings.HasSuffix(lower, ".html") || strings.HasSuffix(lower, ".htm") {
 		return "novel"
 	}
@@ -339,8 +343,8 @@ func BulkCreateComicsWithSource(comics []struct {
 
 		now := time.Now().UTC()
 		stmt, err := tx.Prepare(`
-			INSERT INTO "Comic" ("id", "filename", "title", "titleSortKey", "pageCount", "fileSize", "type", "libraryId", "relativePath", "addedAt", "updatedAt")
-			VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+			INSERT INTO "Comic" ("id", "filename", "title", "titleSortKey", "pageCount", "fileSize", "type", "libraryId", "relativePath", "format", "editionStemKey", "editionMatchKey", "editionLabel", "addedAt", "updatedAt")
+			VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT("id") DO NOTHING
 		`)
 		if err != nil {
@@ -362,7 +366,11 @@ func BulkCreateComicsWithSource(comics []struct {
 				return fmt.Errorf("missing library assignment for %s (%s)", c.Filename, c.ID)
 			}
 			relPath := c.Filename
-			if _, err := stmt.Exec(c.ID, c.Filename, c.Title, BuildTitleSortKey(c.Title), c.FileSize, comicType, libID, relPath, now, now); err != nil {
+			format := ExtractFileFormat(relPath)
+			stemKey := BuildEditionStemKey(relPath)
+			matchKey := BuildEditionMatchKey(relPath, c.Title)
+			edLabel := ExtractEditionLabel(relPath)
+			if _, err := stmt.Exec(c.ID, c.Filename, c.Title, BuildTitleSortKey(c.Title), c.FileSize, comicType, libID, relPath, format, stemKey, matchKey, edLabel, now, now); err != nil {
 				return fmt.Errorf("insert %s into library %s: %w", c.Filename, libID, err)
 			}
 		}
@@ -406,10 +414,17 @@ func deleteComicsByIDBatches(tx *sql.Tx, ids []string) (int64, error) {
 		"ComicGroupItem",
 		"UserComicState",
 		"MetadataSyncLog",
+		"BookEditionItem",
+		"ComicSeriesItem",
 	})
 	if err != nil {
 		return 0, err
 	}
+
+	hasEditionTables, _ := existingTables(tx, []string{"BookEditionGroup", "BookEditionItem"})
+	hasSeriesTables, _ := existingTables(tx, []string{"ComicSeries", "ComicSeriesItem"})
+	affectedGroups := make(map[string]struct{})
+	affectedSeries := make(map[string]struct{})
 
 	var rowsAffected int64
 	for i := 0; i < len(ids); i += batchSize {
@@ -426,6 +441,29 @@ func deleteComicsByIDBatches(tx *sql.Tx, ids []string) (int64, error) {
 		}
 		in := strings.Join(placeholders, ",")
 
+		if len(hasEditionTables) == 2 {
+			if rows, qErr := tx.Query(fmt.Sprintf(`SELECT DISTINCT "groupId" FROM "BookEditionItem" WHERE "comicId" IN (%s)`, in), args...); qErr == nil {
+				for rows.Next() {
+					var gid string
+					if rows.Scan(&gid) == nil && gid != "" {
+						affectedGroups[gid] = struct{}{}
+					}
+				}
+				rows.Close()
+			}
+		}
+		if len(hasSeriesTables) == 2 {
+			if rows, qErr := tx.Query(fmt.Sprintf(`SELECT DISTINCT "seriesId" FROM "ComicSeriesItem" WHERE "comicId" IN (%s)`, in), args...); qErr == nil {
+				for rows.Next() {
+					var sid string
+					if rows.Scan(&sid) == nil && sid != "" {
+						affectedSeries[sid] = struct{}{}
+					}
+				}
+				rows.Close()
+			}
+		}
+
 		for _, table := range relatedTables {
 			if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM "%s" WHERE "comicId" IN (%s)`, table, in), args...); err != nil {
 				return rowsAffected, fmt.Errorf("delete %s records: %w", table, err)
@@ -441,6 +479,31 @@ func deleteComicsByIDBatches(tx *sql.Tx, ids []string) (int64, error) {
 			return rowsAffected, err
 		}
 		rowsAffected += n
+	}
+
+	if len(hasEditionTables) == 2 {
+		for gid := range affectedGroups {
+			if err := refreshEditionGroupMetadataTx(tx, gid); err != nil {
+				return rowsAffected, fmt.Errorf("reconcile edition group %s: %w", gid, err)
+			}
+		}
+	}
+	if len(hasSeriesTables) == 2 {
+		for sid := range affectedSeries {
+			if _, err := tx.Exec(`
+				DELETE FROM "ComicSeries"
+				WHERE "id" = ? AND NOT EXISTS (
+					SELECT 1 FROM "ComicSeriesItem" si WHERE si."seriesId" = "ComicSeries"."id"
+				)
+			`, sid); err != nil {
+				return rowsAffected, fmt.Errorf("cleanup empty series %s: %w", sid, err)
+			}
+		}
+	}
+	if rowsAffected > 0 {
+		if revTables, _ := existingTables(tx, []string{"ComicSeriesSourceRevision"}); len(revTables) == 1 {
+			_, _ = tx.Exec(`UPDATE "ComicSeriesSourceRevision" SET "revision" = "revision" + 1 WHERE "id" = 1`)
+		}
 	}
 	return rowsAffected, nil
 }
@@ -856,24 +919,28 @@ func FixComicLibraryAssignments(fileLibraryMap map[string]string, fileSourceMap 
 		return 0, 0
 	}
 
-	rows, err := db.Query(`SELECT "id", COALESCE("libraryId", ''), COALESCE("relativePath", ''), COALESCE("type", '') FROM "Comic"`)
+	rows, err := db.Query(`SELECT "id", COALESCE("libraryId", ''), COALESCE("relativePath", ''), COALESCE("title", ''), COALESCE("type", '') FROM "Comic"`)
 	if err != nil {
 		return 0, 0
 	}
 
 	type comicUpdate struct {
-		ID           string
-		NewLibID     string
-		NewRelPath   string
-		NewType      string
-		Moved        bool
-		TypeFixed    bool
+		ID              string
+		NewLibID        string
+		NewRelPath      string
+		NewType         string
+		Format          string
+		EditionStemKey  string
+		EditionMatchKey string
+		EditionLabel    string
+		Moved           bool
+		TypeFixed       bool
 	}
 	var toUpdate []comicUpdate
 
 	for rows.Next() {
-		var id, libID, relPath, comicType string
-		if rows.Scan(&id, &libID, &relPath, &comicType) != nil {
+		var id, libID, relPath, title, comicType string
+		if rows.Scan(&id, &libID, &relPath, &title, &comicType) != nil {
 			continue
 		}
 		diskLibID, hasDisk := fileLibraryMap[id]
@@ -910,7 +977,11 @@ func FixComicLibraryAssignments(fileLibraryMap map[string]string, fileSourceMap 
 		if needsUpdate {
 			toUpdate = append(toUpdate, comicUpdate{
 				ID: id, NewLibID: newLibID, NewRelPath: newRelPath, NewType: newType,
-				Moved: wasMoved, TypeFixed: wasTypeFixed,
+				Format:          ExtractFileFormat(newRelPath),
+				EditionStemKey:  BuildEditionStemKey(newRelPath),
+				EditionMatchKey: BuildEditionMatchKey(newRelPath, title),
+				EditionLabel:    ExtractEditionLabel(newRelPath),
+				Moved:           wasMoved, TypeFixed: wasTypeFixed,
 			})
 		}
 	}
@@ -937,13 +1008,13 @@ func FixComicLibraryAssignments(fileLibraryMap map[string]string, fileSourceMap 
 				return err
 			}
 			defer tx.Rollback()
-			stmt, err := tx.Prepare(`UPDATE "Comic" SET "libraryId" = ?, "relativePath" = ?, "type" = ?, "updatedAt" = ? WHERE "id" = ?`)
+			stmt, err := tx.Prepare(`UPDATE "Comic" SET "libraryId" = ?, "relativePath" = ?, "type" = ?, "format" = ?, "editionStemKey" = ?, "editionMatchKey" = ?, "editionLabel" = ?, "updatedAt" = ? WHERE "id" = ?`)
 			if err != nil {
 				return err
 			}
 			defer stmt.Close()
 			for _, u := range batch {
-				if _, err := stmt.Exec(u.NewLibID, u.NewRelPath, u.NewType, now, u.ID); err != nil {
+				if _, err := stmt.Exec(u.NewLibID, u.NewRelPath, u.NewType, u.Format, u.EditionStemKey, u.EditionMatchKey, u.EditionLabel, now, u.ID); err != nil {
 					return err
 				}
 			}
